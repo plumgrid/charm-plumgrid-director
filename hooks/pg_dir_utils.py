@@ -17,6 +17,7 @@ from charmhelpers.core.hookenv import (
     log,
     config,
     unit_get,
+    network_get_primary_address,
     status_set
 )
 from charmhelpers.contrib.network.ip import (
@@ -30,6 +31,7 @@ from charmhelpers.contrib.network.ip import (
 from charmhelpers.core.host import (
     service_start,
     service_stop,
+    service_restart,
     service_running,
     path_hash,
     set_nic_mtu
@@ -61,14 +63,7 @@ PG_IFCS_CONF = '%s/conf/pg/ifcs.conf' % PG_LXC_DATA_PATH
 OPS_CONF = '%s/conf/etc/00-pg.conf' % PG_LXC_DATA_PATH
 AUTH_KEY_PATH = '%s/root/.ssh/authorized_keys' % PG_LXC_DATA_PATH
 TEMP_LICENSE_FILE = '/tmp/license'
-
-# Constant values for OpenStack releases as Canonical-Ubuntu
-# doesn't have any specific solution version associated
-OPENSTACK_RELEASE_VERS = {
-    'kilo': '10',
-    'liberty': '11',
-    'mitaka': '12'
-}
+IFC_LIST_GW = '/var/run/plumgrid/ifc_list_gateway'
 
 BASE_RESOURCE_MAP = OrderedDict([
     (PG_KA_CONF, {
@@ -169,6 +164,49 @@ def determine_packages():
     return pkgs
 
 
+def disable_apparmor_libvirt():
+    '''
+    Disables Apparmor profile of libvirtd.
+    '''
+    apt_install('apparmor-utils')
+    apt_install('cgroup-bin')
+    _exec_cmd(['sudo', 'aa-disable', '/usr/sbin/libvirtd'],
+              error_msg='Error disabling AppArmor profile of libvirtd',
+              verbose=True)
+    disable_apparmor()
+    service_restart('libvirt-bin')
+
+
+def disable_apparmor():
+    '''
+    Disables Apparmor security for lxc.
+    '''
+    try:
+        f = open(LXC_CONF, 'r')
+    except IOError:
+        log('Libvirt not installed yet')
+        return 0
+    filedata = f.read()
+    f.close()
+    newdata = filedata.replace("security_driver = \"apparmor\"",
+                               "#security_driver = \"apparmor\"")
+    f = open(LXC_CONF, 'w')
+    f.write(newdata)
+    f.close()
+
+
+def get_unit_address(binding='internal'):
+    '''
+    Returns the unit's PLUMgrid Management/Fabric IP
+    '''
+    try:
+        # Using Juju 2.0 network spaces feature
+        return network_get_primary_address(binding)
+    except NotImplementedError:
+        # Falling back to private-address
+        return unit_get('private-address')
+
+
 def register_configs(release=None):
     '''
     Returns an object of the Openstack Tempating Class which contains the
@@ -264,10 +302,14 @@ def get_mgmt_interface():
     mgmt_interface = config('mgmt-interface')
     if not mgmt_interface:
         try:
-            return get_iface_from_addr(unit_get('private-address'))
+            return get_iface_from_addr(get_unit_address('internal'))
         except:
+            # workaroud if get_unit_address returns hostname
+            # also workaround the curtin issue where the
+            # interface on which bridge is created also gets
+            # an ip
             for bridge_interface in get_bridges():
-                if (get_host_ip(unit_get('private-address'))
+                if (get_host_ip(get_unit_address())
                         in get_iface_addr(bridge_interface)):
                     return bridge_interface
     elif interface_exists(mgmt_interface):
@@ -275,7 +317,7 @@ def get_mgmt_interface():
     else:
         log('Provided managment interface %s does not exist'
             % mgmt_interface)
-        return get_iface_from_addr(unit_get('private-address'))
+        return get_iface_from_addr(get_unit_address())
 
 
 def fabric_interface_changed():
@@ -294,32 +336,49 @@ def fabric_interface_changed():
     return True
 
 
+def remove_ifc_list():
+    '''
+    Removes ifc_list_gateway file if fabric interface is changed
+    '''
+    _exec_cmd(cmd=['rm', '-f', IFC_LIST_GW])
+
+
 def get_fabric_interface():
     '''
     Returns the fabric interface.
     '''
     fabric_interfaces = config('fabric-interfaces')
-    if fabric_interfaces == 'MANAGEMENT':
-        return get_mgmt_interface()
+    if not fabric_interfaces:
+        try:
+            fabric_ip = get_unit_address('fabric')
+            mgmt_ip = get_unit_address('internal')
+        except:
+            raise ValueError('Unable to get interface using \'fabric\' \
+                              binding! Ensure fabric interface has IP \
+                              assigned.')
+        if fabric_ip == mgmt_ip:
+            return get_mgmt_interface()
+        else:
+            return get_iface_from_addr(fabric_ip)
     else:
         try:
             all_fabric_interfaces = json.loads(fabric_interfaces)
         except ValueError:
             raise ValueError('Invalid json provided for fabric interfaces')
-        hostname = get_unit_hostname()
-        if hostname in all_fabric_interfaces:
-            node_fabric_interface = all_fabric_interfaces[hostname]
-        elif 'DEFAULT' in all_fabric_interfaces:
-            node_fabric_interface = all_fabric_interfaces['DEFAULT']
-        else:
-            raise ValueError('No fabric interface provided for node')
-        if interface_exists(node_fabric_interface):
-            return node_fabric_interface
-        else:
-            log('Provided fabric interface %s does not exist'
-                % node_fabric_interface)
-            raise ValueError('Provided fabric interface does not exist')
+    hostname = get_unit_hostname()
+    if hostname in all_fabric_interfaces:
+        node_fabric_interface = all_fabric_interfaces[hostname]
+    elif 'DEFAULT' in all_fabric_interfaces:
+        node_fabric_interface = all_fabric_interfaces['DEFAULT']
+    else:
+        raise ValueError('No fabric interface provided for node')
+    if interface_exists(node_fabric_interface):
         return node_fabric_interface
+    else:
+        log('Provided fabric interface %s does not exist'
+            % node_fabric_interface)
+        raise ValueError('Provided fabric interface does not exist')
+    return node_fabric_interface
 
 
 def ensure_mtu():
@@ -423,10 +482,13 @@ def sapi_post_ips():
     """
     Posts PLUMgrid nodes IPs to solutions api server.
     """
+    if not config('enable-sapi'):
+        log('Solutions API support is disabled!')
+        return 1
     pg_edge_ips = _pg_edge_ips()
     pg_dir_ips = _pg_dir_ips()
     pg_gateway_ips = _pg_gateway_ips()
-    pg_dir_ips.append(get_host_ip(unit_get('private-address')))
+    pg_dir_ips.append(get_host_ip(get_unit_address()))
     pg_edge_ips = '"edge_ips"' + ':' \
         + '"{}"'.format(','.join(str(i) for i in pg_edge_ips))
     pg_dir_ips = '"director_ips"' + ':' \
@@ -474,6 +536,9 @@ def sapi_post_license():
     '''
     Posts PLUMgrid License to solutions api server
     '''
+    if not config('enable-sapi'):
+        log('Solutions API support is disabled!')
+        return 1
     username = '"user_name":' + '"{}"'.format(config('plumgrid-username'))
     password = '"password":' + '"{}"'.format(config('plumgrid-password'))
     license = '"license":' + '"{}"'.format(config('plumgrid-license-key'))
@@ -493,23 +558,40 @@ def sapi_post_license():
         log(POST_LICENSE)
 
 
+def get_pg_ons_version():
+    '''
+    Returns PG ONS version installed
+    '''
+    package_version = ''
+    for pkg in neutron_plugin_attribute('plumgrid', 'packages', 'neutron'):
+        if 'plumgrid' in pkg:
+            try:
+                # Fetch plumgrid package version installed. If there are
+                # multiple plumgrid packages installed, first package will
+                # be used to fetch the version
+                package_version = apt_cache()[pkg].current_ver.ver_str
+                break
+            except:
+                log('Unable to find the installed package: {}. Posting Zone \
+                     Info to Solutions API server will fail.'.format(pkg))
+                return None
+    return package_version.replace('-', '.', 1).split('-')[0]
+
+
 def sapi_post_zone_info():
     '''
     Posts zone information to solutions api server
     '''
+    if not config('enable-sapi'):
+        log('Solutions API support is disabled!')
+        return 1
     sol_name = '"solution_name":"Ubuntu OpenStack"'
-    release = config('openstack-release')
-    for key, value in OPENSTACK_RELEASE_VERS.iteritems():
-        if release == value:
-            sol_version = value
-        else:
-            sol_version = 10
+    # TODO: get the release using relations with pg-edge or
+    # neutron-api-pg and then assign it to sol_version
+    # release = 'mitaka'
+    sol_version = 10
     sol_version = '"solution_version":"{}"'.format(sol_version)
-    pg_ons_version = _exec_cmd_output(
-        'dpkg -l | grep plumgrid | awk \'{print $3}\' | '
-        'sed \'s/-/./\' | cut -f1 -d"-"',
-        'Unable to obtain PG ONS version'
-    ).replace('\n', '')
+    pg_ons_version = get_pg_ons_version()
     pg_ons_version = \
         '"pg_ons_version":"{}"'.format(pg_ons_version)
     hypervisor = '"hypervisor":"Ubuntu"'

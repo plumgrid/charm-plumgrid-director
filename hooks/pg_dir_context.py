@@ -7,8 +7,7 @@ import re
 from charmhelpers.contrib.openstack import context
 from charmhelpers.contrib.openstack.utils import get_host_ip
 from charmhelpers.core.hookenv import (
-    config,
-    unit_get,
+    config
 )
 from charmhelpers.core.hookenv import (
     relation_ids,
@@ -55,11 +54,11 @@ def _pg_dir_ips():
     Inspects plumgrid-director peer relation and returns the
     ips of the peer directors
     '''
-    return [get_host_ip(rdata['private-address'])
+    return [rdata['unit_ip']
             for rid in relation_ids("director")
             for rdata in
             (relation_get(rid=rid, unit=unit) for unit in related_units(rid))
-            if rdata]
+            if 'unit_ip' in rdata]
 
 
 class PGDirContext(context.NeutronContext):
@@ -98,8 +97,9 @@ class PGDirContext(context.NeutronContext):
 
         conf = config()
         pg_dir_ips = _pg_dir_ips()
+        from pg_dir_utils import get_unit_address
         pg_dir_ips.append(str(get_address_in_network(network=None,
-                          fallback=get_host_ip(unit_get('private-address')))))
+                          fallback=get_host_ip(get_unit_address()))))
         pg_dir_ips = sorted(pg_dir_ips)
         pg_ctxt['director_ips'] = pg_dir_ips
         dir_count = len(pg_dir_ips)

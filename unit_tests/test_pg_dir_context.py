@@ -6,7 +6,6 @@ import charmhelpers
 
 TO_PATCH = [
     'config',
-    'unit_get',
     'get_host_ip',
     'gethostname',
     'getfqdn'
@@ -48,9 +47,10 @@ class PGDirContextTest(CharmTestCase):
     @patch.object(context, '_pg_dir_ips')
     @patch.object(utils, 'get_mgmt_interface')
     @patch.object(utils, 'get_fabric_interface')
-    def test_neutroncc_context_api_rel(self, _fabric_int, _mgmt_int,
-                                       _pg_dir_ips, _unit_priv_ip, _npa,
-                                       _ens_pkgs, _save_ff, _https,
+    @patch.object(utils, 'get_unit_address')
+    def test_neutroncc_context_api_rel(self, _unit_address, _fabric_int,
+                                       _mgmt_int, _pg_dir_ips, _unit_priv_ip,
+                                       _npa, _ens_pkgs, _save_ff, _https,
                                        _is_clus, _unit_get, _config,
                                        _runits, _rids, _rget):
         def mock_npa(plugin, section, manager):

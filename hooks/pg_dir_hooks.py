@@ -44,14 +44,17 @@ from pg_dir_utils import (
     configure_analyst_opsvm,
     sapi_post_ips,
     sapi_post_license,
-    sapi_post_zone_info
+    sapi_post_zone_info,
+    get_unit_address,
+    disable_apparmor_libvirt,
+    remove_ifc_list
 )
 
 hooks = Hooks()
 CONFIGS = register_configs()
 
 
-@hooks.hook()
+@hooks.hook('install.real')
 def install():
     '''
     Install hook is run when the charm is first deployed on a node.
@@ -65,16 +68,19 @@ def install():
         apt_install(pkg, options=['--force-yes'], fatal=True)
     load_iovisor()
     ensure_mtu()
+    disable_apparmor_libvirt()
     CONFIGS.write_all()
 
 
-@hooks.hook('director-relation-joined')
-@hooks.hook('director-relation-changed')
+@hooks.hook('director-relation-joined',
+            'director-relation-changed')
 @restart_on_change(restart_map())
-def dir_joined():
+def dir_joined(relation_id=None):
     '''
     This hook is run when a unit of director is added.
     '''
+    unit_ip = get_unit_address()
+    relation_set(relation_id=relation_id, unit_ip=unit_ip)
     if director_cluster_ready():
         ensure_mtu()
         CONFIGS.write_all()
@@ -91,7 +97,12 @@ def plumgrid_joined(relation_id=None):
     if not is_ip(opsvm_ip):
         raise ValueError('Invalid OPSVM IP specified!')
     else:
-        relation_set(relation_id=relation_id, opsvm_ip=opsvm_ip)
+        relation_settings = {
+            'opsvm_ip': opsvm_ip,
+            'dir_ip': get_unit_address(),
+        }
+        relation_set(relation_id=relation_id,
+                     relation_settings=relation_settings)
     if is_leader():
         sapi_post_ips()
 
@@ -131,6 +142,7 @@ def config_changed():
             log("Fabric interface already set")
         else:
             stop_pg()
+            remove_ifc_list()
     if charm_config.changed('plumgrid-virtual-ip'):
         CONFIGS.write_all()
         for rid in relation_ids('plumgrid'):
@@ -162,14 +174,15 @@ def config_changed():
         stop_pg()
     if (charm_config.changed('sapi-port') or
         charm_config.changed('lcm-ip') or
-            charm_config.changed('sapi-zone')):
+        charm_config.changed('sapi-zone') or
+            charm_config.changed('enable-sapi')):
         if is_leader():
             if is_ip(config('lcm-ip')):
                 sapi_post_zone_info()
             else:
                 raise ValueError('Invalid LCM IP specified!')
-        for rid in relation_ids('plumgrid'):
-            plumgrid_joined(rid)
+            for rid in relation_ids('plumgrid'):
+                plumgrid_joined(rid)
     ensure_mtu()
     CONFIGS.write_all()
     if not service_running('plumgrid'):
