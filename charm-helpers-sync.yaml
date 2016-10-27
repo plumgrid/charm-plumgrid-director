@@ -3,10 +3,11 @@ destination: hooks/charmhelpers
 include:
     - core
     - fetch
+    - osplatform
+    - payload
     - contrib.amulet
     - contrib.hahelpers
     - contrib.network
     - contrib.openstack
     - contrib.python
     - contrib.storage
-    - payload
