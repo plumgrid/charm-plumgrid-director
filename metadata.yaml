@@ -14,7 +14,7 @@ series:
   - xenial
 extra-bindings:
   internal:
-  fabric:
+  compute-data:
 requires:
   plumgrid-plugin:
     interface: plumgrid-plugin
